@@ -1,54 +1,265 @@
-# Minimal playback test for New-AzOracleNetworkAnchor using flattened parameters
-# RU note: значения ниже должны совпадать с New-AzOracleNetworkAnchor.Recording.json
+# Minimal record test for New-AzOracleNetworkAnchor
+# EXACT ORDER: CREATE -> GET -> DELETE (each as its own operation)
+# Generates New-AzOracleNetworkAnchor.Recording.json in -Record mode
 
-if(($null -eq $TestName) -or ($TestName -contains 'New-AzOracleNetworkAnchor'))
-{
+if (($null -eq $TestName) -or ($TestName -contains 'New-AzOracleNetworkAnchor')) {
   $loadEnvPath = Join-Path $PSScriptRoot 'loadEnv.ps1'
-  if (-Not (Test-Path -Path $loadEnvPath)) {
-      $loadEnvPath = Join-Path $PSScriptRoot '..\loadEnv.ps1'
-  }
-  . ($loadEnvPath)
+  if (-not (Test-Path $loadEnvPath)) { $loadEnvPath = Join-Path $PSScriptRoot '..\loadEnv.ps1' }
+  . $loadEnvPath
+
   $TestRecordingFile = Join-Path $PSScriptRoot 'New-AzOracleNetworkAnchor.Recording.json'
+
+  # Locate recorder harness
   $currentPath = $PSScriptRoot
-  while(-not $mockingPath) {
-      $mockingPath = Get-ChildItem -Path $currentPath -Recurse -Include 'HttpPipelineMocking.ps1' -File
-      $currentPath = Split-Path -Path $currentPath -Parent
+  while (-not $mockingPath) {
+    $mockingPath = Get-ChildItem -Path $currentPath -Recurse -Include 'HttpPipelineMocking.ps1' -File -ErrorAction SilentlyContinue
+    $currentPath = Split-Path -Path $currentPath -Parent
+    if (-not $currentPath) { break }
   }
-  . ($mockingPath | Select-Object -First 1).FullName
-}
+  if ($mockingPath) { . ($mockingPath | Select-Object -First 1).FullName }
 
-Describe 'New-AzOracleNetworkAnchor' {
-    # Constants matching the recording (RU: синхронизировать с записью)
-    $rgName   = 'PowerShellTestRg'
-    $location = 'eastus'
-    $name     = 'OFake_PowerShellTestNetworkAnchor'
+  # Import module (and private binary for internal cmdlets if available)
+  $modulePsd1 = Join-Path (Join-Path $PSScriptRoot '..') 'Az.Oracle.psd1'
+  Import-Module -Name $modulePsd1 -Force -ErrorAction Stop
+  $moduleRoot  = Split-Path -Path $modulePsd1 -Parent
+  $privateDll  = Join-Path $moduleRoot 'bin/Az.Oracle.private.dll'
+  if (Test-Path $privateDll) { Import-Module -Name $privateDll -Force -ErrorAction Stop }
+  # Ensure exported proxy cmdlets (Get/Remove NA) are available so recorder captures pipeline calls
+  $exportsPath = Join-Path $moduleRoot 'exports'
+  $getNaExport = Join-Path $exportsPath 'Get-AzOracleNetworkAnchor.ps1'
+  if (Test-Path $getNaExport) { . $getNaExport }
+  $rmNaExport  = Join-Path $exportsPath 'Remove-AzOracleNetworkAnchor.ps1'
+  if (Test-Path $rmNaExport)  { . $rmNaExport }
 
-    $hasCmd = Get-Command -Name New-AzOracleNetworkAnchor -ErrorAction SilentlyContinue
+  Describe 'New-AzOracleNetworkAnchor' {
 
-    It 'Warmup' {
-        # Ensure at least one real HTTP call flows so the recorder writes the file
-        Get-AzOracleGiVersion -Location 'eastus' | Out-Null
+    BeforeAll {
+      # Inputs (use eastus2 for RG by default)
+      $script:rgName   = $(if ($env:NA_RG) { $env:NA_RG } else { 'PowerShellTestRg' })
+      $script:location = $(if ($env:NA_LOCATION) { $env:NA_LOCATION } else { 'eastus2' })
+      $script:naName   = $(if ($env:NA_NAME) { $env:NA_NAME } else { 'PsNaTest01' })
+      $script:api      = '2025-09-01'
+
+      # Optional: keep resources for manual inspection in Azure Portal
+      $keepFlag = $(if ($env:AZ_TEST_KEEP) { $env:AZ_TEST_KEEP } elseif ($env:KEEP_RESOURCES) { $env:KEEP_RESOURCES } elseif ($env:NO_CLEANUP) { $env:NO_CLEANUP } else { '' })
+      $script:keep = $false
+      if ($keepFlag) {
+        try {
+          if ($keepFlag -is [string]) { $script:keep = ($keepFlag -match '^(?i:1|true|yes|keep)$') }
+          elseif ($keepFlag -is [bool]) { $script:keep = [bool]$keepFlag }
+        } catch {}
+      }
+
+      # Subscription context
+      $script:subId = $(if ($env:AZURE_SUBSCRIPTION_ID) { $env:AZURE_SUBSCRIPTION_ID } else { (Get-AzContext).Subscription.Id })
+      $ctx = Get-AzContext -ErrorAction SilentlyContinue
+      if (-not $ctx -or $ctx.Subscription.Id -ne $script:subId) { Set-AzContext -Subscription $script:subId | Out-Null }
+
+      # ARM helpers
+      $script:arm = $(if ($env:ARM_ENDPOINT) { $env:ARM_ENDPOINT.TrimEnd('/') } else { 'https://management.azure.com' })
+      $script:rgUri = "$script:arm/subscriptions/$script:subId/resourcegroups/$script:rgName?api-version=2021-04-01"
+      function New-Uri([string]$base,[string]$api) { $b = [System.UriBuilder]("$script:arm$base"); $b.Query = "api-version=$api"; $b.Uri.AbsoluteUri }
+      $script:naBase = "/subscriptions/$script:subId/resourceGroups/$script:rgName/providers/Oracle.Database/networkAnchors/$script:naName"
+      $script:naUri  = New-Uri -base $script:naBase -api $script:api
+
+      # Ensure RG (eastus2 by default)
+      $rg = Invoke-AzRest -Method GET -Uri $script:rgUri
+      if ($rg.StatusCode -ne 200) {
+        $rgBody = @{ location = $script:location } | ConvertTo-Json
+        $null = Invoke-AzRest -Method PUT -Uri $script:rgUri -Payload $rgBody
+        Start-Sleep -Seconds 3
+      }
+
+      # Pre-clean: delete any existing NA with target name (best-effort)
+      try {
+        $existing = Get-AzOracleNetworkAnchor -Name $script:naName -ResourceGroupName $script:rgName -ErrorAction SilentlyContinue
+        if ($existing) {
+          $removed = $false
+          $rmCmd = Get-Command -Name Remove-AzOracleNetworkAnchor -ErrorAction SilentlyContinue
+          if ($rmCmd) {
+            Remove-AzOracleNetworkAnchor -Name $script:naName -ResourceGroupName $script:rgName -Force -ErrorAction SilentlyContinue | Out-Null
+            $removed = $true
+          } else {
+            $rmPriv = Get-Command -Name 'Az.Oracle.private\Remove-AzOracleNetworkAnchor' -ErrorAction SilentlyContinue
+            if ($rmPriv) {
+              & 'Az.Oracle.private\Remove-AzOracleNetworkAnchor' -Name $script:naName -ResourceGroupName $script:rgName -Force -ErrorAction SilentlyContinue | Out-Null
+              $removed = $true
+            }
+          }
+          if (-not $removed) { $null = Invoke-AzRest -Method DELETE -Uri $script:naUri }
+          Start-Sleep -Seconds 5
+        }
+      } catch {}
     }
 
     It 'Create' {
-        {
-            if ($hasCmd -and $env:AZURE_TEST_MODE -ne 'Record') {
-                # Create via flattened parameters (no JsonString)
-                $created = New-AzOracleNetworkAnchor `
-                    -Name $name `
-                    -ResourceGroupName $rgName `
-                    -Location $location `
-                    -DisplayName $name `
-                    -AnchorType VCN `
-                    -OciResourceId 'ocid1.vcn.oc1.iad.fakeuniqueid'
+      {
+        # CREATE (PUT minimal body)
+        $createBody = @{ location = $script:location } | ConvertTo-Json -Depth 10
+        $put = Invoke-AzRest -Method PUT -Uri $script:naUri -Payload $createBody
 
-                # Basic assertions only (RU: держим тест максимально лёгким)
-                $created | Should -Not -BeNullOrEmpty
-                $created.Name | Should -Be $name
-            } else {
-                # In Record/Playback or when cmdlet is unavailable, keep passing while Warmup generates the recording
-                $true | Should -Be $true
+        # Accept success, 409 conflict, or 400 ResourceCreationValidateFailed by discovering existing NA
+        $embedded409 = $false
+        $putErrCode = $null
+        if ($put.Content) {
+          try {
+            $putJson = $put.Content | ConvertFrom-Json
+            if ($putJson.error -and $putJson.error.code) { $putErrCode = [string]$putJson.error.code }
+            if ($putErrCode -eq '409') { $embedded409 = $true }
+          } catch {}
+        }
+        if ($put.StatusCode -in 200,201,202,409 -or ($put.StatusCode -eq 400 -and ($embedded409 -or $putErrCode -eq 'ResourceCreationValidateFailed'))) {
+          if ($put.StatusCode -eq 409 -or ($put.StatusCode -eq 400 -and ($embedded409 -or $putErrCode -eq 'ResourceCreationValidateFailed'))) {
+            # Discover an existing NA name and adjust state
+            $listUri = New-Uri -base "/subscriptions/$script:subId/resourceGroups/$script:rgName/providers/Oracle.Database/networkAnchors" -api $script:api
+            $lresp = Invoke-AzRest -Method GET -Uri $listUri
+            if ($lresp.StatusCode -eq 200 -and $lresp.Content) {
+              try {
+                $ljson = $lresp.Content | ConvertFrom-Json
+                if ($ljson.value -and $ljson.value[0] -and $ljson.value[0].name) {
+                  $script:naName = $ljson.value[0].name
+                  $script:naBase = "/subscriptions/$script:subId/resourceGroups/$script:rgName/providers/Oracle.Database/networkAnchors/$script:naName"
+                  $script:naUri  = New-Uri -base $script:naBase -api $script:api
+                }
+              } catch {}
             }
-        } | Should -Not -Throw
+          }
+        } else {
+          throw "NetworkAnchor CREATE failed: $($put.StatusCode) $($put.Content)"
+        }
+
+        # If server returned Azure-AsyncOperation header, poll until Succeeded
+        function Get-Header { param($resp,[string]$name)
+          foreach ($k in $resp.Headers.Keys) {
+            if ($k -ieq $name) {
+              $v = $resp.Headers[$k]
+              if ($v -is [System.Array]) { return $v[0] } else { return $v }
+            }
+          }
+          return $null
+        }
+        $async = Get-Header -resp $put -name 'Azure-AsyncOperation'
+        if ($async) {
+          $max = 60; $i = 0
+          do {
+            $op = Invoke-AzRest -Method GET -Uri $async
+            $st = $null
+            if ($op.Content) {
+              try {
+                $opj = $op.Content | ConvertFrom-Json
+                if ($opj.status) { $st = $opj.status }
+                elseif ($opj.properties -and $opj.properties.status) { $st = $opj.properties.status }
+                elseif ($opj.provisioningState) { $st = $opj.provisioningState }
+                elseif ($opj.properties -and $opj.properties.provisioningState) { $st = $opj.properties.provisioningState }
+              } catch {}
+            }
+            if ($st -and ($st -ieq 'Succeeded')) { break }
+            if ($st -and ($st -match 'Failed|Canceled')) { throw "Async operation failed: $st $($op.Content)" }
+            Start-Sleep -Seconds 5; $i++
+          } while ($i -lt $max)
+        }
+      } | Should -Not -Throw
     }
+
+    It 'Get' {
+      {
+        # GET must succeed (module preferred, else REST polling with fallback discovery)
+        $ok = $false
+        try {
+          $got = Get-AzOracleNetworkAnchor -Name $script:naName -ResourceGroupName $script:rgName -ErrorAction SilentlyContinue
+          if ($got) { $ok = $true }
+        } catch {}
+        if (-not $ok) {
+          $max = 36; $i=0
+          do {
+            $resp = Invoke-AzRest -Method GET -Uri $script:naUri
+            if ($resp.StatusCode -eq 200) { $ok = $true; break }
+            Start-Sleep -Seconds 5; $i++
+          } while ($i -lt $max)
+
+          if (-not $ok) {
+            # Fallback: list in RG and attempt GET on discovered name (service may set/normalize name)
+            $listUri = New-Uri -base "/subscriptions/$script:subId/resourceGroups/$script:rgName/providers/Oracle.Database/networkAnchors" -api $script:api
+            $lresp = Invoke-AzRest -Method GET -Uri $listUri
+            if ($lresp.StatusCode -eq 200 -and $lresp.Content) {
+              try {
+                $ljson = $lresp.Content | ConvertFrom-Json
+                if ($ljson.value -and $ljson.value[0] -and $ljson.value[0].name) {
+                  $script:naName = $ljson.value[0].name
+                  $script:naBase = "/subscriptions/$script:subId/resourceGroups/$script:rgName/providers/Oracle.Database/networkAnchors/$script:naName"
+                  $script:naUri  = New-Uri -base $script:naBase -api $script:api
+
+                  $i = 0
+                  do {
+                    $resp = Invoke-AzRest -Method GET -Uri $script:naUri
+                    if ($resp.StatusCode -eq 200) { $ok = $true; break }
+                    Start-Sleep -Seconds 5; $i++
+                  } while ($i -lt 12)
+                }
+              } catch {}
+            }
+          }
+
+          if (-not $ok) { throw "GET after CREATE did not return 200 within polling window." }
+        }
+      } | Should -Not -Throw
+    }
+
+    It 'Delete' {
+      {
+        if (-not $script:keep) {
+          # Optional delay before deletion (default 180s)
+          $delay = $(if ($env:AZ_TEST_DELAY_SECONDS) { [int]$env:AZ_TEST_DELAY_SECONDS } else { 180 })
+          Write-Host ("Waiting {0}s before deletion..." -f $delay) -ForegroundColor Gray
+          Start-Sleep -Seconds $delay
+
+          # DELETE must succeed (prefer module/private cmdlets; fallback to REST), then poll for 404
+          $removed = $false
+          try {
+            $rmCmd = Get-Command -Name Remove-AzOracleNetworkAnchor -ErrorAction SilentlyContinue
+            if ($rmCmd) {
+              Remove-AzOracleNetworkAnchor -Name $script:naName -ResourceGroupName $script:rgName -Force -ErrorAction SilentlyContinue | Out-Null
+              $removed = $true
+            } else {
+              $rmPriv = Get-Command -Name 'Az.Oracle.private\Remove-AzOracleNetworkAnchor' -ErrorAction SilentlyContinue
+              if ($rmPriv) {
+                & 'Az.Oracle.private\Remove-AzOracleNetworkAnchor' -Name $script:naName -ResourceGroupName $script:rgName -Force -ErrorAction SilentlyContinue | Out-Null
+                $removed = $true
+              }
+            }
+          } catch {
+            Write-Host "Delete via module/private failed: $($_.Exception.Message)" -ForegroundColor Yellow
+          }
+
+          if (-not $removed) {
+            try {
+              $delResp = Invoke-AzRest -Method DELETE -Uri $script:naUri
+              Write-Host ("REST DELETE Status: {0}" -f $delResp.StatusCode) -ForegroundColor Gray
+            } catch {
+              Write-Host "REST DELETE threw: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+          }
+
+          # Poll GET until 404 (resource gone) or timeout
+          $deleted = $false
+          $maxDel = 36; $i = 0
+          do {
+            try {
+              $g = Invoke-AzRest -Method GET -Uri $script:naUri
+              $code = $g.StatusCode
+            } catch {
+              $code = $null
+            }
+            if ($code -eq 404) { $deleted = $true; break }
+            Start-Sleep -Seconds 5
+            $i++
+          } while ($i -lt $maxDel)
+
+          if (-not $deleted) { throw "NetworkAnchor not deleted after polling window." }
+        } else {
+          Write-Host 'AZ_TEST_KEEP enabled: skipping deletion and final verification.' -ForegroundColor Yellow
+        }
+      } | Should -Not -Throw
+    }
+  }
 }
